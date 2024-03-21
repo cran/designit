@@ -1,0 +1,11 @@
+---
+title: "Plate layouts"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Plate layouts}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+---
+
+```{r, child="cached/_plate_layouts.html"}
+```

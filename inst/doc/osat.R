@@ -1,0 +1,219 @@
+params <-
+list(iterations = 1000L)
+
+## ----include = FALSE----------------------------------------------------------
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 6,
+  fig.height = 6
+)
+
+## ----setup--------------------------------------------------------------------
+library(designit)
+library(tidyverse)
+if (!requireNamespace("OSAT")) {
+  print("This vignette can only be rendered if `OSAT` package is installed.")
+  knitr::knit_exit()
+}
+
+## -----------------------------------------------------------------------------
+osat_data_path <- system.file("extdata", package = "OSAT")
+samples <- read_tsv(file.path(osat_data_path, "samples.txt"),
+  col_types = cols(SampleType = col_factor(), Race = col_factor(), AgeGrp = col_factor())
+) |>
+  mutate(dummy_var1 = rnorm(n()), dummy_var2 = str_c(SampleType, Race, sep = " "))
+
+## -----------------------------------------------------------------------------
+gs <- OSAT::setup.sample(samples, optimal = c("SampleType", "Race", "AgeGrp"))
+
+gc <- OSAT::setup.container(OSAT::IlluminaBeadChip96Plate, 7, batch = "plates")
+
+set.seed(1234)
+
+bench::system_time(
+  g_setup <- OSAT::create.optimized.setup(sample = gs, container = gc, nSim = params$iterations)
+)
+
+OSAT::QC(g_setup)
+
+## -----------------------------------------------------------------------------
+set.seed(1234)
+
+g_setup_start <- OSAT::create.optimized.setup(sample = gs, container = gc, nSim = 1) |>
+  OSAT::get.experiment.setup()
+
+## -----------------------------------------------------------------------------
+OSAT::get.experiment.setup(g_setup) |>
+  select(AgeGrp, plates, chipRows, chipColumns, chips, rows, columns, wells) |>
+  pivot_longer(-AgeGrp) |>
+  count(AgeGrp, value, name) |>
+  ggplot(aes(AgeGrp, n, fill = factor(value))) +
+  geom_col(position = "dodge") +
+  facet_wrap(~name, scales = "free_y")
+
+## -----------------------------------------------------------------------------
+plot_batch <- function(df) {
+  df |>
+    select(plates, SampleType, Race, AgeGrp) |>
+    pivot_longer(c(SampleType, Race, AgeGrp), names_to = "variable", values_to = "level") |>
+    count(plates, variable, level) |>
+    ggplot(aes(level, n, fill = factor(plates))) +
+    geom_col(position = "dodge") +
+    facet_wrap(~variable, scales = "free", ncol = 1)
+}
+
+## -----------------------------------------------------------------------------
+g_setup_start |> plot_batch()
+
+## -----------------------------------------------------------------------------
+OSAT::get.experiment.setup(g_setup) |>
+  plot_batch()
+
+## -----------------------------------------------------------------------------
+OSAT::getLayout(gc) |>
+  left_join(OSAT::get.experiment.setup(g_setup)) |>
+  data.table::data.table() |>
+  osat_score("plates", c("SampleType", "Race", "AgeGrp")) |>
+  with(score)
+
+# score using OSAT
+g_setup@metadata$optValue |> tail(1)
+
+## -----------------------------------------------------------------------------
+bc <- BatchContainer$new(
+  dimensions = c(plates = 7, chips = 8, rows = 6, columns = 2)
+)
+bc
+
+bc$n_locations
+
+## -----------------------------------------------------------------------------
+bc <- assign_in_order(bc, samples)
+
+starting_assignment <- bc$get_locations() |>
+  left_join(g_setup_start) |>
+  pull(ID) |>
+  as.integer()
+
+bc$move_samples(location_assignment = starting_assignment)
+
+bc$get_samples(remove_empty_locations = TRUE) |>
+  plot_batch()
+
+## -----------------------------------------------------------------------------
+scoring_f <- osat_score_generator("plates", c("SampleType", "Race", "AgeGrp"))
+
+bc$score(scoring_f)
+g_setup@metadata$optValue |> head(1)
+# should be identical
+
+bench::system_time({
+  set.seed(123)
+  bc_reference <- optimize_design(bc, scoring = scoring_f, max_iter = params$iterations)
+})
+
+## -----------------------------------------------------------------------------
+# final score
+bc_reference$score(scoring_f)
+bc_reference$plot_trace() +
+  ggtitle(str_glue("Final score={bc$score(scoring_f)}"))
+bc$get_samples(remove_empty_locations = TRUE) |>
+  plot_batch()
+
+## -----------------------------------------------------------------------------
+fast_osat_optimize <- function(bc, batch_vars, feature_vars, iterations) {
+  bc <- bc$copy()
+  ldf <- data.table::data.table(bc$get_locations())[, c("plates")][, ".sample_id" := bc$assignment]
+  fcols <- c(".sample_id", feature_vars)
+  smp <- data.table::data.table(bc$samples)[, ..fcols]
+  df <- smp[ldf, on = ".sample_id"]
+
+  v <- osat_score(df, batch_vars, feature_vars)
+  edf <- v$expected_dt
+  current_score <- v$score
+  scores <- numeric(length = iterations)
+  n_avail <- nrow(df)
+
+  for (i in 1:iterations) {
+    repeat {
+      pos <- sample(n_avail, 2)
+
+      # does not make sense to shuffle NAs
+      if (any(!is.na(df[pos, feature_vars[1]]))) {
+        break
+      }
+    }
+
+    val <- df[c(pos[2], pos[1]), fcols, with = FALSE]
+    df[c(pos[1], pos[2]), (fcols) := val]
+
+    new_score <- osat_score(df, batch_vars, feature_vars, edf)$score
+    if (new_score <= current_score) {
+      current_score <- new_score
+    } else {
+      df[c(pos[2], pos[1]), (fcols) := val]
+    }
+
+    scores[i] <- current_score
+  }
+
+  bc$assignment <- df$.sample_id
+
+  list(bc=bc, scores=scores)
+}
+
+bench::system_time({
+  set.seed(123)
+  opt_res <- fast_osat_optimize(bc, "plates", c("SampleType", "Race", "AgeGrp"), iterations = params$iterations)
+})
+
+## -----------------------------------------------------------------------------
+scoring_f <- osat_score_generator("plates", c("SampleType", "Race", "AgeGrp"))
+
+burn_in_it <- floor(params$iterations * 0.1)
+burn_in_it
+
+bench::system_time({
+  set.seed(123)
+  bc_burn_in <- optimize_design(
+    bc,
+    scoring = scoring_f,
+    n_shuffle = c(
+      rep(20, burn_in_it),
+      rep(
+        2,
+        params$iterations - burn_in_it
+      )
+    ),
+    max_iter = params$iterations
+  )
+})
+
+## -----------------------------------------------------------------------------
+tibble(
+  i = bc_burn_in$trace$scores[[1]]$step,
+  normal = bc_reference$trace$scores[[1]]$score_1,
+  burnin = bc_burn_in$trace$scores[[1]]$score_1
+) |>
+  pivot_longer(-i, names_to = "method", values_to = "score") |>
+  ggplot(aes(i, score, col = method)) +
+  geom_line()
+
+## -----------------------------------------------------------------------------
+bc$score(scoring_f)
+
+## -----------------------------------------------------------------------------
+assign_random(bc)
+
+bc$get_samples()
+bc$get_samples(remove_empty_locations = TRUE)
+
+scoring_f <- list(
+  fc0 = function(samples) rnorm(1) + 2 * rexp(1),
+  fc1 = function(samples) rnorm(1, 100),
+  fc2 = function(samples) -7
+)
+
+bc$score(scoring_f)
+
